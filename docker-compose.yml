@@ -1,0 +1,27 @@
+services:
+  api:
+    build: .
+    image: telemetry-api:latest
+    init: true
+    ports:
+      - "8000:8000"
+    environment:
+      TELEMETRY_DB_PATH: /data/telemetry.db
+    volumes:
+      - telemetry-data:/data
+    restart: unless-stopped
+    stop_grace_period: 10s
+    healthcheck:
+      # 仅依赖镜像自带的 Python，无需额外安装 curl/wget；失败时 docker ps 显示 unhealthy
+      test:
+        - CMD
+        - python
+        - -c
+        - "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=2).status == 200 else 1)"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  telemetry-data:
