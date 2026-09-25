@@ -36,7 +36,10 @@
 - 入组期间成员配置被锁定：PUT /devices/{id}/config 对已入组设备提交与任一所属组
   不一致的窗口大小或允许迟到秒数时一律返回 409 且不写入（成员尚无窗口也不得改窗口
   大小，允许迟到秒数也不得随时改），避免同组窗口时间范围或封存时点错开导致组汇总
-  失真；提交与所属组完全相同的配置是幂等重复提交，返回 200。未入组设备沿用既有规则
+  失真；提交与所属组完全相同的配置是幂等重复提交，返回 200。旧库纠偏时（提交与全部
+  所属组一致），写入前在同一写锁事务内核对设备已有窗口的起点对齐与实际跨度：任一窗口
+  与目标 window_size_seconds 不相容同样返回 409，设备配置、窗口及组汇总保持原样，
+  全部相容才允许纠正仅配置字段的历史漂移。未入组设备沿用既有规则
   （已有窗口数据后不得改窗口大小，允许迟到秒数可随时调整）。
 - 组创建的成员校验/落盘与设备配置更新都在 BEGIN IMMEDIATE 写锁事务内完成、彼此
   串行，避免并发交错留下"已入组但配置漂移"的成员。
@@ -815,6 +818,33 @@ def device_group_rows(conn: sqlite3.Connection, device_id: str) -> list[sqlite3.
     ).fetchall()
 
 
+def incompatible_device_windows(
+    conn: sqlite3.Connection, device_id: str, size: int
+) -> list[tuple[float, float]]:
+    """返回该设备已有窗口中与目标窗口大小**不相容**的 (window_start, window_end)。
+
+    旧库可能留下"设备已入组、组配置为 size，但设备配置与历史窗口按另一个窗口大小
+    落盘"的漂移成员。把配置纠正回组配置前必须先确认每个现存窗口：
+    - 起点对齐：window_start 是 size 网格上的整数倍（与 reconcile_group 的网格过滤同口径，
+      非整数 / 非整除起点在组对账中会被静默排除，无法落到任何组窗口）；
+    - 实际跨度相容：window_end - window_start == size（跨度不同的窗口无法解释为组网格上的窗口）。
+    任一条件不满足即视为不相容；返回结果按 window_start 升序，无窗口或全部相容时为空。
+    """
+    rows = conn.execute(
+        "SELECT window_start, window_end FROM windows WHERE device_id = ? ORDER BY window_start",
+        (device_id,),
+    ).fetchall()
+    incompatible: list[tuple[float, float]] = []
+    for r in rows:
+        start = r["window_start"]
+        end = r["window_end"]
+        aligned = start == int(start) and int(start) % size == 0
+        correct_span = abs((end - start) - size) < 1e-9
+        if not aligned or not correct_span:
+            incompatible.append((start, end))
+    return incompatible
+
+
 def reconcile_group(
     conn: sqlite3.Connection,
     group_id: str,
@@ -1453,6 +1483,12 @@ def put_device_config(device_id: str, cfg: DeviceConfig) -> DeviceOut:
       大小（否则同组 window_start 时间范围错开），允许迟到秒数同样不得随时改
       （否则各成员封存时点不一致，组汇总会提前/延后出数）。提交与所属组完全相同的
       配置属于幂等重复提交，返回 200（也可借此把历史漂移配置纠正回组配置）。
+    - 旧库纠偏防护：提交与所有所属组一致时，落盘前在**同一写锁事务内**核对该设备已有
+      窗口的起点对齐（window_start 为窗口大小网格上的整数倍）与实际跨度
+      （window_end - window_start 等于窗口大小）；任一窗口与目标窗口大小不相容即返回
+      409，设备配置、窗口及组汇总全部保持原样——这种旧库漂移无法靠仅纠正配置字段修复，
+      必须显式暴露而非让异网格窗口在组对账中被静默排除。全部相容时才允许落盘，以纠正
+      "仅配置字段漂移"（窗口本身仍按组窗口大小落盘）的历史数据。
 
     整个"读设备/读所属组 → 校验 → 写入"在单个 BEGIN IMMEDIATE 写锁事务内完成，
     与同样持写锁的 POST /groups 串行化：组创建的成员校验与设备配置更新不可能交错，
@@ -1487,7 +1523,26 @@ def put_device_config(device_id: str, cfg: DeviceConfig) -> DeviceOut:
                             + ", ".join(mismatched)
                         ),
                     )
-                # 与所属组配置完全相同：幂等重复提交，按组配置落盘（可纠正历史漂移）。
+                # 与所属组配置完全相同：纠偏旧库前先核对已有窗口能否按组窗口大小解释。
+                # 旧库漂移成员的历史窗口可能按另一窗口大小落盘（起点不在本组网格上或跨度
+                # 不等于组窗口大小），仅纠正配置字段无法让这些窗口进入组对账；此时返回 409
+                # 且整事务回滚，设备配置、窗口与组汇总均保持原样。
+                bad_windows = incompatible_device_windows(conn, device_id, cfg.window_size_seconds)
+                if bad_windows:
+                    first_start, _first_end = bad_windows[0]
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "existing window is incompatible with the group's"
+                            f" window_size_seconds={cfg.window_size_seconds} (window_start not"
+                            " aligned to the grid or window_end - window_start differs);"
+                            " cannot correct config drift for this legacy device without"
+                            " reconciling its windows. First incompatible window_start: "
+                            + to_iso(first_start)
+                            + f"; {len(bad_windows)} incompatible window(s) in total"
+                        ),
+                    )
+                # 全部窗口相容（或本无窗口）：幂等重复提交，按组配置落盘（可纠正仅配置字段漂移）。
                 conn.execute(
                     "UPDATE devices SET window_size_seconds = ?, allowed_lateness_seconds = ?"
                     " WHERE device_id = ?",
